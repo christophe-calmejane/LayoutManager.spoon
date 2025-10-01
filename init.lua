@@ -15,35 +15,26 @@ obj.newLayoutWindow = nil
 obj.menubar = nil
 obj.lastAction = 0
 
--- Snapshot current layout
+-- Storage mode constants
+obj.STORAGE_MODE_SCREEN_RELATIVE = "screen-relative"
+obj.STORAGE_MODE_GLOBAL_COORDINATES = "global-coordinates"
+
+-- Snapshot current layout (legacy function for clipboard)
 function obj:snapshotLayout()
-  local layout = {}
-  local windows = hs.window.allWindows()
-
-  for _, win in ipairs(windows) do
-    local app = win:application():name()
-    local title = win:title()
-    local frame = win:frame()
-    local screen = win:screen():id()
-
-    local screenFrame = win:screen():frame()
-    local frame = win:frame()
-    table.insert(layout, {
-      app = app,
-      title = title,
-      relX = (frame.x - screenFrame.x) / screenFrame.w,
-      relY = (frame.y - screenFrame.y) / screenFrame.h,
-      relW = frame.w / screenFrame.w,
-      relH = frame.h / screenFrame.h,
-      screen = win:screen():id()
-    })
-  end
-
+  local layout = self:snapshotCurrentLayout(self.STORAGE_MODE_SCREEN_RELATIVE)
   hs.pasteboard.setContents(hs.inspect(layout))
 end
 
 -- Apply layout
 function obj:applyLayout(layoutDef)
+  -- Determine storage mode - check for global coordinates or default to screen-relative
+  local storageMode = self.STORAGE_MODE_SCREEN_RELATIVE
+  if layoutDef.storageMode then
+    storageMode = layoutDef.storageMode
+  elseif layoutDef.layout and #layoutDef.layout > 0 and layoutDef.layout[1].globalX then
+    storageMode = self.STORAGE_MODE_GLOBAL_COORDINATES
+  end
+
   for _, winDef in ipairs(layoutDef.layout) do
     local app = hs.application.get(winDef.app)
     if app then
@@ -52,20 +43,35 @@ function obj:applyLayout(layoutDef)
       end) or app:mainWindow()
 
       if matchedWindow then
-        local screen = hs.screen.find(winDef.screen)
-        if screen then
-          local screenFrame = screen:frame()
-          matchedWindow:setFrame({
-            x = screenFrame.x + winDef.relX * screenFrame.w,
-            y = screenFrame.y + winDef.relY * screenFrame.h,
-            w = winDef.relW * screenFrame.w,
-            h = winDef.relH * screenFrame.h
-          })
+        if storageMode == self.STORAGE_MODE_GLOBAL_COORDINATES then
+          -- Use global coordinates
+          if winDef.globalX and winDef.globalY and winDef.globalW and winDef.globalH then
+            matchedWindow:setFrame({
+              x = winDef.globalX,
+              y = winDef.globalY,
+              w = winDef.globalW,
+              h = winDef.globalH
+            })
+          end
+        else
+          -- Use screen-relative coordinates (backward compatibility)
+          local screen = hs.screen.find(winDef.screen)
+          if screen and winDef.relX and winDef.relY and winDef.relW and winDef.relH then
+            local screenFrame = screen:frame()
+            matchedWindow:setFrame({
+              x = screenFrame.x + winDef.relX * screenFrame.w,
+              y = screenFrame.y + winDef.relY * screenFrame.h,
+              w = winDef.relW * screenFrame.w,
+              h = winDef.relH * screenFrame.h
+            })
+          end
         end
       end
     end
   end
-  hs.alert.show("Layout \"" .. layoutDef.name .. "\" applied")
+
+  local modeText = storageMode == self.STORAGE_MODE_GLOBAL_COORDINATES and " (Global)" or " (Screen-Relative)"
+  hs.alert.show("Layout \"" .. layoutDef.name .. "\"" .. modeText .. " applied")
 end
 
 -- Save layouts to file
@@ -144,10 +150,11 @@ function obj:removeLayout(layoutName)
 end
 
 function obj:updateLayout(layoutName)
-  local currentLayout = self:snapshotCurrentLayout()
-
   for i, layout in ipairs(self.layoutData) do
     if layout.name == layoutName then
+      -- Preserve the storage mode when updating
+      local storageMode = layout.storageMode or self.STORAGE_MODE_SCREEN_RELATIVE
+      local currentLayout = self:snapshotCurrentLayout(storageMode)
       layout.layout = currentLayout
       break
     end
@@ -158,7 +165,10 @@ function obj:updateLayout(layoutName)
   hs.alert.show("Layout '" .. layoutName .. "' updated")
 end
 
-function obj:snapshotCurrentLayout()
+function obj:snapshotCurrentLayout(storageMode)
+  -- Default to screen-relative mode for backward compatibility
+  storageMode = storageMode or self.STORAGE_MODE_SCREEN_RELATIVE
+
   local layout = {}
   local windows = hs.window.allWindows()
 
@@ -166,19 +176,30 @@ function obj:snapshotCurrentLayout()
     local app = win:application():name()
     local title = win:title()
     local frame = win:frame()
-    local screen = win:screen():id()
+    local screen = win:screen()
+    local screenFrame = screen:frame()
 
-    local screenFrame = win:screen():frame()
-    local frame = win:frame()
-    table.insert(layout, {
+    local windowData = {
       app = app,
       title = title,
-      relX = (frame.x - screenFrame.x) / screenFrame.w,
-      relY = (frame.y - screenFrame.y) / screenFrame.h,
-      relW = frame.w / screenFrame.w,
-      relH = frame.h / screenFrame.h,
-      screen = win:screen():id()
-    })
+    }
+
+    if storageMode == self.STORAGE_MODE_GLOBAL_COORDINATES then
+      -- Store absolute coordinates
+      windowData.globalX = frame.x
+      windowData.globalY = frame.y
+      windowData.globalW = frame.w
+      windowData.globalH = frame.h
+    else
+      -- Store screen-relative coordinates (backward compatibility)
+      windowData.relX = (frame.x - screenFrame.x) / screenFrame.w
+      windowData.relY = (frame.y - screenFrame.y) / screenFrame.h
+      windowData.relW = frame.w / screenFrame.w
+      windowData.relH = frame.h / screenFrame.h
+      windowData.screen = screen:id()
+    end
+
+    table.insert(layout, windowData)
   end
 
   return layout
@@ -199,9 +220,18 @@ function obj:showLayoutManagerUI()
       shortcutText = table.concat(layout.shortcut.mods, "+") .. "+" .. layout.shortcut.key
     end
 
+    -- Determine storage mode display text
+    local modeText = "Screen-Relative"
+    if layout.storageMode == self.STORAGE_MODE_GLOBAL_COORDINATES then
+      modeText = "Global"
+    elseif layout.layout and #layout.layout > 0 and layout.layout[1].globalX then
+      modeText = "Global"
+    end
+
     table.insert(tableData, {
       name = layout.name,
       shortcut = shortcutText,
+      mode = modeText,
       remove = "Remove",
       update = "Update"
     })
@@ -373,6 +403,7 @@ function obj:showLayoutManagerUI()
           <tr>
             <th>Name</th>
             <th>Shortcut</th>
+            <th>Mode</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -391,8 +422,9 @@ function obj:showLayoutManagerUI()
             const row = tbody.insertRow();
             row.insertCell(0).textContent = layout.name;
             row.insertCell(1).textContent = layout.shortcut;
+            row.insertCell(2).textContent = layout.mode;
 
-            const actionCell = row.insertCell(2);
+            const actionCell = row.insertCell(3);
             actionCell.innerHTML =
               '<button class="apply-btn" onclick="applyLayout(\'' + layout.name + '\')">Apply</button>' +
               '<button class="update-btn" onclick="updateLayout(\'' + layout.name + '\')">Update</button>' +
@@ -482,12 +514,14 @@ function obj:showNewLayoutUI()
         <style>
           body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; }
           input { width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ddd; border-radius: 3px; }
+          select { width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ddd; border-radius: 3px; }
           button { padding: 8px 16px; margin: 5px; cursor: pointer; border: none; border-radius: 3px; }
           .create-btn { background-color: #4CAF50; color: white; }
           .cancel-btn { background-color: #f44336; color: white; }
           .snapshot-btn { background-color: #2196F3; color: white; }
           .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
           .close-btn { background-color: #666; color: white; border: none; border-radius: 3px; padding: 8px 16px; float: right; }
+          .storage-mode-info { font-size: 12px; color: #666; margin-top: 5px; }
         </style>
       </head>
       <body>
@@ -499,6 +533,15 @@ function obj:showNewLayoutUI()
         <label>Layout Name:</label>
         <input type="text" id="layoutName" placeholder="Enter layout name">
 
+        <label>Storage Mode:</label>
+        <select id="storageMode" onchange="updateStorageModeInfo()">
+          <option value="screen-relative">Screen-Relative (Legacy)</option>
+          <option value="global-coordinates" selected>Global Coordinates (Recommended)</option>
+        </select>
+        <div id="storageModeInfo" class="storage-mode-info">
+          Stores window positions relative to their screen. May break when screen setup changes.
+        </div>
+
         <label>Shortcut (optional - format: cmd+alt+ctrl):</label>
         <input type="text" id="shortcutMods" placeholder="cmd+alt+ctrl (leave empty for no shortcut)" value="">
 
@@ -509,25 +552,40 @@ function obj:showNewLayoutUI()
         <button class="snapshot-btn" onclick="createLayout()">Take Snapshot & Create</button>
 
         <script>
+          function updateStorageModeInfo() {
+            const mode = document.getElementById('storageMode').value;
+            const info = document.getElementById('storageModeInfo');
+
+            if (mode === 'global-coordinates') {
+              info.textContent = 'Stores absolute screen coordinates. More reliable when moving between different screen setups.';
+            } else {
+              info.textContent = 'Stores window positions relative to their screen. May break when screen setup changes.';
+            }
+          }
+
           function createLayout() {
             console.log('Create layout clicked');
             const name = document.getElementById('layoutName').value;
             const mods = document.getElementById('shortcutMods').value;
             const key = document.getElementById('shortcutKey').value;
+            const storageMode = document.getElementById('storageMode').value;
 
             if (!name) {
               alert('Please enter a layout name');
               return;
             }
 
-            // Allow empty shortcuts
-            document.title = 'CREATE_LAYOUT:' + name + ':' + (mods || '') + ':' + (key || '');
+            // Include storage mode in the message
+            document.title = 'CREATE_LAYOUT:' + name + ':' + (mods || '') + ':' + (key || '') + ':' + storageMode;
           }
 
           function cancelNewLayout() {
             console.log('Cancel clicked');
             document.title = 'CANCEL_NEW_LAYOUT';
           }
+
+          // Initialize storage mode info
+          updateStorageModeInfo();
         </script>
       </body>
       </html>
@@ -556,7 +614,7 @@ function obj:showNewLayoutUI()
             end
           elseif title:match("CREATE_LAYOUT:(.+)") then
             local params = title:match("CREATE_LAYOUT:(.+)")
-            local name, mods, key = params:match("([^:]*):([^:]*):([^:]*)")
+            local name, mods, key, storageMode = params:match("([^:]*):([^:]*):([^:]*):([^:]*)")
             if name and name ~= "" then
               self.lastAction = currentTime
 
@@ -572,7 +630,11 @@ function obj:showNewLayoutUI()
               local finalKey = (key and key ~= "") and key or nil
               local finalMods = (#modList > 0) and modList or nil
 
-              self:createNewLayout(name, finalMods, finalKey)
+              -- Default to screen-relative if storage mode is empty
+              local finalStorageMode = (storageMode and storageMode ~= "") and storageMode or
+                  self.STORAGE_MODE_SCREEN_RELATIVE
+
+              self:createNewLayout(name, finalMods, finalKey, finalStorageMode)
 
               self.newLayoutWindow:delete()
               self.newLayoutWindow = nil
@@ -589,12 +651,14 @@ function obj:showNewLayoutUI()
 end
 
 -- Create new layout with snapshot
-function obj:createNewLayout(name, mods, key)
-  local layout = self:snapshotCurrentLayout()
+function obj:createNewLayout(name, mods, key, storageMode)
+  storageMode = storageMode or self.STORAGE_MODE_SCREEN_RELATIVE
+  local layout = self:snapshotCurrentLayout(storageMode)
 
   local newLayout = {
     name = name,
-    layout = layout
+    layout = layout,
+    storageMode = storageMode
   }
 
   -- Only add shortcut if both mods and key are provided
@@ -609,7 +673,9 @@ function obj:createNewLayout(name, mods, key)
   self:saveLayoutsToFile()
   self:loadLayouts()   -- Reload to update hotkeys and menubar
   self:refreshMainUI() -- Refresh the UI to show the new layout
-  hs.alert.show("Layout '" .. name .. "' created")
+
+  local modeText = storageMode == self.STORAGE_MODE_GLOBAL_COORDINATES and " (Global)" or " (Screen-Relative)"
+  hs.alert.show("Layout '" .. name .. "'" .. modeText .. " created")
 end
 
 -- Setup menubar
